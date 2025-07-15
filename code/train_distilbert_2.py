@@ -11,11 +11,17 @@ from transformers import (
     AutoModelForSequenceClassification,
     TrainingArguments,
     Trainer,
-    DataCollatorWithPadding
+    DataCollatorWithPadding,
+    set_seed, # <--- ADICIONADO: Para reprodutibilidade
+    EarlyStoppingCallback # <--- ADICIONADO: Para parar o treinamento inteligentemente
 )
 import torch
 from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
 from functools import partial
+
+# --- ADICIONADO: Definir uma semente global para reprodutibilidade ---
+# Isso garante que a divisão do dataset e a inicialização do modelo sejam as mesmas a cada execução
+set_seed(42)
 
 # 1. Filtra task_id == 4 e prepara o dataset
 def load_task4_dataset(json_path):
@@ -37,25 +43,15 @@ def load_task4_dataset(json_path):
 
         if user_msg and assistant_response:
             try:
-                # Avalia a string com segurança para um dicionário Python
                 labels_dict = ast.literal_eval(assistant_response.strip())
-                # Extrai todos os valores do dicionário, tratando listas e valores únicos
                 extracted_labels = []
                 for key, value in labels_dict.items():
                     if isinstance(value, list):
-                        # Filtra para garantir que apenas strings não-vazias e não-None sejam adicionadas
                         extracted_labels.extend([v for v in value if isinstance(v, str) and v.strip() != ''])
                     else:
-                        # Filtra para garantir que apenas strings não-vazias e não-None sejam adicionadas
                         if isinstance(value, str) and value.strip() != '':
                             extracted_labels.append(value)
-                        # Opcional: Adicione um print para depurar se houver valores inesperados
-                        # elif value is None:
-                        #     print(f"Aviso: Encontrado valor None para o rótulo '{key}'. Ignorando.")
-                        # else:
-                        #     print(f"Aviso: Encontrado valor inesperado '{value}' para o rótulo '{key}'. Ignorando.")
 
-                # Adiciona a amostra apenas se houver rótulos válidos extraídos
                 if extracted_labels:
                     samples.append({"text": user_msg, "labels": extracted_labels})
                 else:
@@ -74,21 +70,17 @@ dataset = load_task4_dataset(json_path)
 
 # 3. Codifica os rótulos para Multi-Label
 all_labels = [label for sample in dataset for label in sample["labels"]]
-# Verifique se all_labels está vazio aqui. Se estiver, significa que nenhuma amostra
-# com rótulos válidos foi carregada.
 if not all_labels:
     raise ValueError("Não foram encontrados rótulos válidos no dataset. Verifique o seu arquivo JSON.")
 
 mlb = MultiLabelBinarizer()
-mlb.fit([all_labels]) # Ajusta ao conjunto de todos os rótulos possíveis
+mlb.fit([all_labels])
 
-# Transforma os rótulos no dataset
 def binarize_labels(example, mlb_fitted):
     return {"labels": mlb_fitted.transform([example["labels"]])[0].astype(float)}
 
 dataset = dataset.map(partial(binarize_labels, mlb_fitted=mlb))
 
-# Salva o MultiLabelBinarizer para inferência futura
 with open("multi_label_binarizer.pkl", "wb") as f:
     pickle.dump(mlb, f)
 
@@ -142,12 +134,17 @@ training_args = TrainingArguments(
     learning_rate=2e-5,
     per_device_train_batch_size=8,
     per_device_eval_batch_size=8,
-    num_train_epochs=10,
+    num_train_epochs=20, # <--- AUMENTADO: Mais épocas para o Early Stopping agir
     weight_decay=0.01,
     save_strategy="epoch",
     load_best_model_at_end=True,
     logging_dir="./logs",
-    report_to="none"
+    report_to="none",
+    # --- NOVAS CONFIGURAÇÕES DE TREINAMENTO ---
+    warmup_ratio=0.06, # <--- ADICIONADO: Aquecimento de LR
+    fp16=True, # <--- ADICIONADO: Habilita Mixed Precision (se GPU compatível)
+    metric_for_best_model="f1_macro", # <--- ADICIONADO: Otimizar para F1-Macro
+    greater_is_better=True, # <--- ADICIONADO: F1-Macro é melhor quando maior
 )
 
 trainer = Trainer(
@@ -157,7 +154,14 @@ trainer = Trainer(
     eval_dataset=eval_dataset,
     tokenizer=tokenizer,
     data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
-    compute_metrics=compute_metrics
+    compute_metrics=compute_metrics,
+    # --- ADICIONADO: Callbacks de treinamento ---
+    callbacks=[
+        EarlyStoppingCallback(
+            early_stopping_patience=3, # Parar se não houver melhora por 3 épocas
+            early_stopping_threshold=0.001 # Melhora mínima para contar
+        )
+    ]
 )
 
 trainer.train()
